@@ -1,9 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import { INITIAL_RECIPES } from './initialRecipes';
 import { supabase, isSupabaseConfigured } from './supabaseClient';
 import {
   Utensils, Calendar, Plus, Search, Trash2, Eye, X, CheckCircle2,
-  Database, HardDrive, Flame, Drumstick, Wheat, Droplet, Sparkles, Save, Copy, Tag, RefreshCw, Pencil
+  Database, HardDrive, Flame, Drumstick, Wheat, Droplet, Sparkles, Save, Copy, Tag,
+  Pencil, FileDown
 } from 'lucide-react';
 
 const DIAS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
@@ -45,7 +48,6 @@ export default function App() {
   const [dietName, setDietName] = useState('Dieta Semanal Principal');
   const [plan, setPlan] = useState(createEmptyPlan());
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
   const [toast, setToast] = useState(null);
 
   // Filtros y modales
@@ -66,9 +68,8 @@ export default function App() {
     setTimeout(() => setToast(null), 3500);
   };
 
-  // Sincroniza nuevas recetas de v5 y rellena el campo `categoria` en las existentes
-  const syncCatalogWithDatabase = async (existingList, notify = false) => {
-    setSyncing(true);
+  // Sincronización silenciosa inicial con INITIAL_RECIPES
+  const syncCatalogSilently = async (existingList) => {
     try {
       const existingByName = new Map();
       existingList.forEach(r => existingByName.set(normalizeName(r.nombre), r));
@@ -91,17 +92,13 @@ export default function App() {
       if (isSupabaseConfigured) {
         if (toInsert.length > 0) {
           const { error } = await supabase.from('recetas').insert(toInsert);
-          if (!error) {
-            merged = [...merged, ...toInsert];
-          }
+          if (!error) merged = [...merged, ...toInsert];
         }
         for (const item of toUpdateCategory) {
           await supabase.from('recetas').update({ categoria: item.categoria }).eq('id', item.id);
         }
       } else {
-        if (toInsert.length > 0) {
-          merged = [...merged, ...toInsert];
-        }
+        if (toInsert.length > 0) merged = [...merged, ...toInsert];
       }
 
       if (toUpdateCategory.length > 0) {
@@ -114,16 +111,9 @@ export default function App() {
       }
 
       setRecipes(merged);
-      if (notify) {
-        showToast(`Catálogo actualizado: ${toInsert.length} nuevas, ${toUpdateCategory.length} categorizadas`);
-      }
-      return merged;
     } catch (err) {
-      console.error('Error sincronizando catálogo:', err);
-      if (notify) showToast('Revisa que hayas añadido la columna categoria en Supabase');
-      return existingList;
-    } finally {
-      setSyncing(false);
+      console.error('Error sincronizando catálogo inicial:', err);
+      setRecipes(existingList);
     }
   };
 
@@ -142,7 +132,7 @@ export default function App() {
               await supabase.from('recetas').insert(INITIAL_RECIPES);
               setRecipes(INITIAL_RECIPES);
             } else {
-              await syncCatalogWithDatabase(dbRecipes, false);
+              await syncCatalogSilently(dbRecipes);
             }
           }
           const { data: dbDiets } = await supabase.from('dietas_semanales').select('*');
@@ -158,7 +148,7 @@ export default function App() {
       } else {
         const savedRec = localStorage.getItem('nutriplan_recetas');
         if (savedRec) {
-          await syncCatalogWithDatabase(JSON.parse(savedRec), false);
+          await syncCatalogSilently(JSON.parse(savedRec));
         } else {
           setRecipes(INITIAL_RECIPES);
           localStorage.setItem('nutriplan_recetas', JSON.stringify(INITIAL_RECIPES));
@@ -441,6 +431,265 @@ export default function App() {
     };
   }, [dailyTotals]);
 
+  // GENERAR PDF DE LA DIETA SEMANAL (Cuadrante semanal + Ingredientes y Preparación de cada receta)
+  const handleExportDietPDF = () => {
+    const usedIdsSet = new Set();
+    DIAS.forEach(dia => {
+      INGESTAS.forEach(ing => {
+        (plan[dia]?.[ing] || []).forEach(id => {
+          if (recipeMap[id]) usedIdsSet.add(id);
+        });
+      });
+    });
+
+    if (usedIdsSet.size === 0) {
+      showToast('Añade al menos una receta al plan semanal antes de generar el PDF');
+      return;
+    }
+
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+    const title = dietName?.trim() || 'Dieta Semanal';
+    const fecha = new Date().toLocaleDateString('es-ES');
+
+    // Cabecera Página 1: Planificación Semanal
+    doc.setFillColor(4, 120, 87); // Emerald 700
+    doc.rect(0, 0, 297, 22, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text(title, 14, 11);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9.5);
+    doc.text(
+      `NutriPlan Pro · Fecha: ${fecha} · Media diaria: ${weeklyAverage.kcal} kcal | ${weeklyAverage.proteina}g Prot | ${weeklyAverage.hidratos}g HC | ${weeklyAverage.grasas}g Grasas`,
+      14,
+      17.5
+    );
+
+    // Tabla semanal (Filas = Ingestas + Totales diarios, Columnas = Lunes..Domingo)
+    const head = [['Ingesta', ...DIAS]];
+    const body = INGESTAS.map(ing => {
+      const row = [ing];
+      DIAS.forEach(dia => {
+        const items = (plan[dia]?.[ing] || [])
+          .map(id => recipeMap[id])
+          .filter(Boolean);
+        if (items.length === 0) {
+          row.push('—');
+        } else {
+          row.push(
+            items
+              .map(r => `• ${r.nombre}
+  (${Math.round(r.kcal)} kcal · ${r.proteina}g P)`)
+              .join('
+')
+          );
+        }
+      });
+      return row;
+    });
+
+    // Fila resumen nutricional por día
+    const totalsRow = ['Total Diario'];
+    DIAS.forEach(dia => {
+      const t = dailyTotals[dia];
+      totalsRow.push(
+        `${Math.round(t.kcal)} kcal
+P: ${t.proteina.toFixed(0)}g · HC: ${t.hidratos.toFixed(0)}g
+G: ${t.grasas.toFixed(0)}g · Fibra: ${t.fibra.toFixed(0)}g`
+      );
+    });
+    body.push(totalsRow);
+
+    autoTable(doc, {
+      startY: 26,
+      head,
+      body,
+      theme: 'grid',
+      margin: { left: 10, right: 10 },
+      styles: {
+        font: 'helvetica',
+        fontSize: 7.5,
+        cellPadding: 2.2,
+        textColor: [30, 41, 59],
+        lineColor: [203, 213, 225],
+        lineWidth: 0.2,
+        valign: 'top',
+        overflow: 'linebreak'
+      },
+      headStyles: {
+        fillColor: [30, 41, 59],
+        textColor: [255, 255, 255],
+        fontStyle: 'bold',
+        halign: 'center',
+        fontSize: 8.5
+      },
+      columnStyles: {
+        0: { cellWidth: 25, fontStyle: 'bold', fillColor: [241, 245, 249] },
+        1: { cellWidth: 36 },
+        2: { cellWidth: 36 },
+        3: { cellWidth: 36 },
+        4: { cellWidth: 36 },
+        5: { cellWidth: 36 },
+        6: { cellWidth: 36 },
+        7: { cellWidth: 36 }
+      },
+      didParseCell: (data) => {
+        if (data.section === 'body' && data.row.index === body.length - 1) {
+          data.cell.styles.fillColor = [236, 253, 245];
+          data.cell.styles.fontStyle = 'bold';
+          data.cell.styles.textColor = [6, 95, 70];
+        }
+      }
+    });
+
+    // Páginas siguientes (Vertical A4): Recetario detallado con Ingredientes y Preparación
+    const usedRecipes = Array.from(usedIdsSet)
+      .map(id => recipeMap[id])
+      .filter(Boolean);
+
+    doc.addPage('a4', 'portrait');
+
+    doc.setFillColor(4, 120, 87);
+    doc.rect(0, 0, 210, 20, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(14);
+    doc.text('Recetario de la Semana: Ingredientes y Preparación', 14, 10);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.text(`${title} · ${usedRecipes.length} platos incluidos en el menú`, 14, 16);
+
+    let cursorY = 26;
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const marginX = 14;
+    const contentWidth = 210 - marginX * 2;
+
+    usedRecipes.forEach((rec, index) => {
+      const ingText = (rec.ingredientes || 'Sin ingredientes especificados').trim();
+      const prepText = (rec.preparacion || 'Sin método de preparación especificado').trim();
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9);
+      const ingLines = doc.splitTextToSize(ingText, contentWidth - 8);
+      const prepLines = doc.splitTextToSize(prepText, contentWidth - 8);
+
+      const lineHeight = 4.3;
+      const estimatedBlockHeight =
+        16 + // Cabecera receta + macros
+        7 + ingLines.length * lineHeight +
+        7 + prepLines.length * lineHeight +
+        10;
+
+      if (cursorY + Math.min(estimatedBlockHeight, 95) > pageHeight - 14) {
+        doc.addPage('a4', 'portrait');
+        cursorY = 16;
+      }
+
+      // Título de la receta
+      doc.setFillColor(241, 245, 249);
+      doc.roundedRect(marginX, cursorY, contentWidth, 13, 2, 2, 'F');
+
+      doc.setTextColor(15, 23, 42);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(11);
+      const headerTitle = `${index + 1}. ${rec.nombre}`;
+      const titleLines = doc.splitTextToSize(headerTitle, contentWidth - 6);
+      doc.text(titleLines[0], marginX + 3, cursorY + 5.5);
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.2);
+      doc.setTextColor(4, 120, 87);
+      doc.text(
+        `${rec.categoria || 'General'} · Porción: ${rec.porcion_g || 0}g · ${Math.round(rec.kcal || 0)} kcal | Prot: ${rec.proteina || 0}g | HC: ${rec.hidratos || 0}g | Grasas: ${rec.grasas || 0}g`,
+        marginX + 3,
+        cursorY + 10.5
+      );
+
+      cursorY += 17;
+
+      // Subsección Ingredientes
+      if (cursorY + 12 > pageHeight - 14) {
+        doc.addPage('a4', 'portrait');
+        cursorY = 16;
+      }
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.2);
+      doc.setTextColor(51, 65, 85);
+      doc.text('Ingredientes:', marginX + 2, cursorY);
+      cursorY += 4.8;
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.8);
+      doc.setTextColor(30, 41, 59);
+      ingLines.forEach(line => {
+        if (cursorY > pageHeight - 14) {
+          doc.addPage('a4', 'portrait');
+          cursorY = 16;
+        }
+        doc.text(line, marginX + 4, cursorY);
+        cursorY += lineHeight;
+      });
+
+      cursorY += 2.5;
+
+      // Subsección Preparación
+      if (cursorY + 12 > pageHeight - 14) {
+        doc.addPage('a4', 'portrait');
+        cursorY = 16;
+      }
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.2);
+      doc.setTextColor(51, 65, 85);
+      doc.text('Preparación:', marginX + 2, cursorY);
+      cursorY += 4.8;
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.8);
+      doc.setTextColor(30, 41, 59);
+      prepLines.forEach(line => {
+        if (cursorY > pageHeight - 14) {
+          doc.addPage('a4', 'portrait');
+          cursorY = 16;
+        }
+        doc.text(line, marginX + 4, cursorY);
+        cursorY += lineHeight;
+      });
+
+      // Separador entre recetas
+      cursorY += 3;
+      if (cursorY < pageHeight - 14) {
+        doc.setDrawColor(226, 232, 240);
+        doc.setLineWidth(0.3);
+        doc.line(marginX, cursorY, marginX + contentWidth, cursorY);
+        cursorY += 6;
+      }
+    });
+
+    // Numeración de páginas
+    const totalPages = doc.getNumberOfPages();
+    for (let i = 1; i <= totalPages; i++) {
+      doc.setPage(i);
+      const pw = doc.internal.pageSize.getWidth();
+      const ph = doc.internal.pageSize.getHeight();
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8);
+      doc.setTextColor(148, 163, 184);
+      doc.text(`NutriPlan Pro · Página ${i} de ${totalPages}`, pw - 14, ph - 6, { align: 'right' });
+    }
+
+    const safeFileName = title
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '');
+
+    doc.save(`${safeFileName || 'dieta-semanal'}.pdf`);
+    showToast('PDF de la dieta semanal generado correctamente');
+  };
+
   const filteredRecipes = recipes.filter(r => {
     const matchesText = r.nombre.toLowerCase().includes(searchTerm.toLowerCase()) ||
                         r.ingredientes.toLowerCase().includes(searchTerm.toLowerCase());
@@ -580,6 +829,13 @@ export default function App() {
                       <Copy className="w-4 h-4" /> Nueva Semana
                     </button>
                     <button
+                      onClick={handleExportDietPDF}
+                      title="Descargar PDF con el cuadrante semanal, ingredientes y preparación de cada receta"
+                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold bg-rose-600 text-white hover:bg-rose-700 shadow-sm transition"
+                    >
+                      <FileDown className="w-4 h-4" /> Descargar PDF
+                    </button>
+                    <button
                       onClick={handleSaveDiet}
                       className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 shadow-sm transition"
                     >
@@ -716,29 +972,17 @@ export default function App() {
                         className="w-full pl-10 pr-4 py-2 bg-slate-50 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
                       />
                     </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <select
-                        value={categoryFilter}
-                        onChange={(e) => setCategoryFilter(e.target.value)}
-                        className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-medium text-slate-700"
-                      >
-                        {categories.map(cat => (
-                          <option key={cat} value={cat}>
-                            {cat === 'Todas' ? 'Todas las categorías' : cat}
-                          </option>
-                        ))}
-                      </select>
-
-                      <button
-                        onClick={() => syncCatalogWithDatabase(recipes, true)}
-                        disabled={syncing}
-                        title="Importar recetas nuevas del Excel y actualizar categorías"
-                        className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition"
-                      >
-                        <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />
-                        Sincronizar Excel
-                      </button>
-                    </div>
+                    <select
+                      value={categoryFilter}
+                      onChange={(e) => setCategoryFilter(e.target.value)}
+                      className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-medium text-slate-700"
+                    >
+                      {categories.map(cat => (
+                        <option key={cat} value={cat}>
+                          {cat === 'Todas' ? 'Todas las categorías' : cat}
+                        </option>
+                      ))}
+                    </select>
                   </div>
 
                   {/* Filtro rápido por Dieta de Origen */}
