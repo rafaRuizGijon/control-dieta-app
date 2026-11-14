@@ -208,6 +208,38 @@ export default function App() {
     showToast('Lienzo listo para nueva dieta semanal');
   };
 
+  const handleDeleteDiet = async () => {
+    const isSaved = weeklyDiets.some(d => d.id === currentDietId);
+    if (!isSaved) {
+      setPlan(createEmptyPlan());
+      showToast('Menú vaciado');
+      return;
+    }
+
+    if (!window.confirm(`¿Seguro que quieres eliminar la dieta "${dietName}"?`)) return;
+
+    const updatedDiets = weeklyDiets.filter(d => d.id !== currentDietId);
+    setWeeklyDiets(updatedDiets);
+
+    if (isSupabaseConfigured) {
+      await supabase.from('dietas_semanales').delete().eq('id', currentDietId);
+    } else {
+      localStorage.setItem('nutriplan_dietas', JSON.stringify(updatedDiets));
+    }
+
+    if (updatedDiets.length > 0) {
+      setCurrentDietId(updatedDiets[0].id);
+      setDietName(updatedDiets[0].nombre);
+      setPlan(updatedDiets[0].plan);
+    } else {
+      setCurrentDietId('dieta-' + Date.now());
+      setDietName('Dieta Semanal Principal');
+      setPlan(createEmptyPlan());
+    }
+
+    showToast('Dieta semanal eliminada');
+  };
+
   // Autogenerar dieta rápida con recetas existentes
   const handleAutoFillWeek = () => {
     if (recipes.length === 0) return;
@@ -366,22 +398,31 @@ export default function App() {
                       className="font-semibold text-slate-800 bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
                     />
                     {weeklyDiets.length > 0 && (
-                      <select
-                        value={currentDietId}
-                        onChange={(e) => {
-                          const found = weeklyDiets.find(d => d.id === e.target.value);
-                          if (found) {
-                            setCurrentDietId(found.id);
-                            setDietName(found.nombre);
-                            setPlan(found.plan);
-                          }
-                        }}
-                        className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-sm"
-                      >
-                        {weeklyDiets.map(d => (
-                          <option key={d.id} value={d.id}>{d.nombre}</option>
-                        ))}
-                      </select>
+                      <div className="flex items-center gap-1.5">
+                        <select
+                          value={currentDietId}
+                          onChange={(e) => {
+                            const found = weeklyDiets.find(d => d.id === e.target.value);
+                            if (found) {
+                              setCurrentDietId(found.id);
+                              setDietName(found.nombre);
+                              setPlan(found.plan);
+                            }
+                          }}
+                          className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-sm"
+                        >
+                          {weeklyDiets.map(d => (
+                            <option key={d.id} value={d.id}>{d.nombre}</option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={handleDeleteDiet}
+                          title="Eliminar dieta seleccionada"
+                          className="p-2 rounded-xl text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-200 transition"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     )}
                   </div>
 
