@@ -480,10 +480,8 @@ export default function App() {
         } else {
           row.push(
             items
-              .map(r => `• ${r.nombre}
-  (${Math.round(r.kcal)} kcal · ${r.proteina}g P)`)
-              .join('
-')
+              .map(r => '• ' + r.nombre + '\n  (' + Math.round(r.kcal) + ' kcal · ' + r.proteina + 'g P)')
+              .join('\n')
           );
         }
       });
@@ -495,9 +493,7 @@ export default function App() {
     DIAS.forEach(dia => {
       const t = dailyTotals[dia];
       totalsRow.push(
-        `${Math.round(t.kcal)} kcal
-P: ${t.proteina.toFixed(0)}g · HC: ${t.hidratos.toFixed(0)}g
-G: ${t.grasas.toFixed(0)}g · Fibra: ${t.fibra.toFixed(0)}g`
+        Math.round(t.kcal) + ' kcal\nP: ' + t.proteina.toFixed(0) + 'g · HC: ' + t.hidratos.toFixed(0) + 'g\nG: ' + t.grasas.toFixed(0) + 'g · Fibra: ' + t.fibra.toFixed(0) + 'g'
       );
     });
     body.push(totalsRow);
