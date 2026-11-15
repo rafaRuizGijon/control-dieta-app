@@ -6,7 +6,7 @@ import { supabase, isSupabaseConfigured } from './supabaseClient';
 import {
   Utensils, Calendar, Plus, Search, Trash2, Eye, X, CheckCircle2,
   Database, HardDrive, Flame, Drumstick, Wheat, Droplet, Sparkles, Save, Copy, Tag,
-  Pencil, FileDown
+  Pencil, FileDown, Users, LogOut, ShieldCheck, Clock, Lock, Mail, UserPlus, LogIn
 } from 'lucide-react';
 
 const DIAS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
@@ -40,14 +40,57 @@ const createEmptyPlan = () => {
 
 const normalizeName = (str) => (str || '').trim().toLowerCase();
 
+// Envío de notificación a rafaelalon@gmail.com vía EmailJS REST API (sin dependencias extra)
+const notifyAdminByEmail = async ({ userName, userEmail }) => {
+  const serviceId = import.meta.env.VITE_EMAILJS_SERVICE_ID;
+  const templateId = import.meta.env.VITE_EMAILJS_TEMPLATE_ID;
+  const publicKey = import.meta.env.VITE_EMAILJS_PUBLIC_KEY;
+
+  if (!serviceId || !templateId || !publicKey) return;
+
+  try {
+    await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        service_id: serviceId,
+        template_id: templateId,
+        user_id: publicKey,
+        template_params: {
+          to_email: 'rafaelalon@gmail.com',
+          user_name: userName || userEmail,
+          user_email: userEmail,
+          app_url: window.location.origin
+        }
+      })
+    });
+  } catch (err) {
+    console.error('Error enviando notificación EmailJS:', err);
+  }
+};
+
 export default function App() {
+  // Estados de autenticación y perfil
+  const [session, setSession] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
+  const [authNombre, setAuthNombre] = useState('');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authMessage, setAuthMessage] = useState(null);
+
+  // Estados de la aplicación
   const [activeTab, setActiveTab] = useState('planificador');
   const [recipes, setRecipes] = useState([]);
   const [weeklyDiets, setWeeklyDiets] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
   const [currentDietId, setCurrentDietId] = useState('dieta-actual');
   const [dietName, setDietName] = useState('Dieta Semanal Principal');
+  const [assignedUserId, setAssignedUserId] = useState('');
   const [plan, setPlan] = useState(createEmptyPlan());
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState(null);
 
   // Filtros y modales
@@ -55,7 +98,7 @@ export default function App() {
   const [originFilter, setOriginFilter] = useState('Todas');
   const [categoryFilter, setCategoryFilter] = useState('Todas');
   const [selectedRecipeModal, setSelectedRecipeModal] = useState(null);
-  const [pickerTarget, setPickerTarget] = useState(null); // { dia, ingesta }
+  const [pickerTarget, setPickerTarget] = useState(null);
   const [pickerSearch, setPickerSearch] = useState('');
   const [pickerCategory, setPickerCategory] = useState('Todas');
 
@@ -63,12 +106,73 @@ export default function App() {
   const [editingRecipeId, setEditingRecipeId] = useState(null);
   const [newRecipe, setNewRecipe] = useState(EMPTY_RECIPE_FORM);
 
+  const isAdmin = userProfile?.rol === 'admin' && userProfile?.aprobado === true;
+  const isApprovedUser = userProfile?.aprobado === true;
+
   const showToast = (msg) => {
     setToast(msg);
     setTimeout(() => setToast(null), 3500);
   };
 
-  // Sincronización silenciosa inicial con INITIAL_RECIPES
+  // Cargar perfil del usuario autenticado
+  const fetchUserProfile = async (user) => {
+    if (!user || !isSupabaseConfigured) {
+      setUserProfile(null);
+      return null;
+    }
+    const { data, error } = await supabase
+      .from('perfiles')
+      .select('*')
+      .eq('id', user.id)
+      .single();
+
+    if (!error && data) {
+      setUserProfile(data);
+      return data;
+    }
+
+    // Fallback por si el trigger aún no creó el registro
+    const isOwner = (user.email || '').toLowerCase() === 'rafaelalon@gmail.com';
+    const fallbackProfile = {
+      id: user.id,
+      email: user.email,
+      nombre: user.user_metadata?.nombre || user.email.split('@')[0],
+      rol: isOwner ? 'admin' : 'usuario',
+      aprobado: isOwner
+    };
+    await supabase.from('perfiles').upsert([fallbackProfile]);
+    setUserProfile(fallbackProfile);
+    return fallbackProfile;
+  };
+
+  // Suscripción a sesión de Supabase Auth
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      setAuthLoading(false);
+      return;
+    }
+
+    supabase.auth.getSession().then(async ({ data: { session: currentSession } }) => {
+      setSession(currentSession);
+      if (currentSession?.user) {
+        await fetchUserProfile(currentSession.user);
+      }
+      setAuthLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
+      setSession(newSession);
+      if (newSession?.user) {
+        await fetchUserProfile(newSession.user);
+      } else {
+        setUserProfile(null);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Sincronización silenciosa inicial con INITIAL_RECIPES (solo admin)
   const syncCatalogSilently = async (existingList) => {
     try {
       const existingByName = new Map();
@@ -89,25 +193,17 @@ export default function App() {
 
       let merged = [...existingList];
 
-      if (isSupabaseConfigured) {
-        if (toInsert.length > 0) {
-          const { error } = await supabase.from('recetas').insert(toInsert);
-          if (!error) merged = [...merged, ...toInsert];
-        }
-        for (const item of toUpdateCategory) {
-          await supabase.from('recetas').update({ categoria: item.categoria }).eq('id', item.id);
-        }
-      } else {
-        if (toInsert.length > 0) merged = [...merged, ...toInsert];
+      if (toInsert.length > 0) {
+        const { error } = await supabase.from('recetas').insert(toInsert);
+        if (!error) merged = [...merged, ...toInsert];
+      }
+      for (const item of toUpdateCategory) {
+        await supabase.from('recetas').update({ categoria: item.categoria }).eq('id', item.id);
       }
 
       if (toUpdateCategory.length > 0) {
         const catMap = new Map(toUpdateCategory.map(u => [u.id, u.categoria]));
         merged = merged.map(r => (catMap.has(r.id) ? { ...r, categoria: catMap.get(r.id) } : r));
-      }
-
-      if (!isSupabaseConfigured) {
-        localStorage.setItem('nutriplan_recetas', JSON.stringify(merged));
       }
 
       setRecipes(merged);
@@ -117,60 +213,174 @@ export default function App() {
     }
   };
 
-  // Cargar datos iniciales (Supabase o LocalStorage)
+  // Cargar datos cuando el usuario está aprobado
   useEffect(() => {
-    async function loadData() {
+    if (!isSupabaseConfigured || !session?.user || !isApprovedUser) return;
+
+    async function loadAuthorizedData() {
       setLoading(true);
-      if (isSupabaseConfigured) {
-        try {
-          const { data: dbRecipes, error: recErr } = await supabase
-            .from('recetas')
-            .select('*')
-            .order('nombre');
-          if (!recErr && dbRecipes) {
-            if (dbRecipes.length === 0) {
-              await supabase.from('recetas').insert(INITIAL_RECIPES);
-              setRecipes(INITIAL_RECIPES);
-            } else {
-              await syncCatalogSilently(dbRecipes);
-            }
+      try {
+        // 1. Cargar recetas
+        const { data: dbRecipes, error: recErr } = await supabase
+          .from('recetas')
+          .select('*')
+          .order('nombre');
+
+        if (!recErr && dbRecipes) {
+          if (dbRecipes.length === 0 && isAdmin) {
+            await supabase.from('recetas').insert(INITIAL_RECIPES);
+            setRecipes(INITIAL_RECIPES);
+          } else if (isAdmin) {
+            await syncCatalogSilently(dbRecipes);
+          } else {
+            setRecipes(dbRecipes);
           }
-          const { data: dbDiets } = await supabase.from('dietas_semanales').select('*');
-          if (dbDiets && dbDiets.length > 0) {
-            setWeeklyDiets(dbDiets);
-            setCurrentDietId(dbDiets[0].id);
-            setDietName(dbDiets[0].nombre);
-            setPlan(dbDiets[0].plan);
-          }
-        } catch (e) {
-          console.error('Error cargando Supabase:', e);
         }
-      } else {
-        const savedRec = localStorage.getItem('nutriplan_recetas');
-        if (savedRec) {
-          await syncCatalogSilently(JSON.parse(savedRec));
+
+        // 2. Cargar dietas (RLS filtra automáticamente: admin ve todas, usuario solo las suyas)
+        const { data: dbDiets } = await supabase
+          .from('dietas_semanales')
+          .select('*')
+          .order('updated_at', { ascending: false });
+
+        if (dbDiets && dbDiets.length > 0) {
+          setWeeklyDiets(dbDiets);
+          setCurrentDietId(dbDiets[0].id);
+          setDietName(dbDiets[0].nombre);
+          setAssignedUserId(dbDiets[0].usuario_id || '');
+          setPlan(dbDiets[0].plan);
         } else {
-          setRecipes(INITIAL_RECIPES);
-          localStorage.setItem('nutriplan_recetas', JSON.stringify(INITIAL_RECIPES));
+          setWeeklyDiets([]);
+          setCurrentDietId('dieta-' + Date.now());
+          setDietName('Dieta Semanal Principal');
+          setAssignedUserId('');
+          setPlan(createEmptyPlan());
         }
-        const savedDiets = localStorage.getItem('nutriplan_dietas');
-        if (savedDiets) {
-          const parsed = JSON.parse(savedDiets);
-          if (parsed.length > 0) {
-            setWeeklyDiets(parsed);
-            setCurrentDietId(parsed[0].id);
-            setDietName(parsed[0].nombre);
-            setPlan(parsed[0].plan);
-          }
+
+        // 3. Si es admin, cargar listado de usuarios para asignar dietas y aprobar altas
+        if (isAdmin) {
+          const { data: profilesData } = await supabase
+            .from('perfiles')
+            .select('*')
+            .order('created_at', { ascending: false });
+          if (profilesData) setAllUsers(profilesData);
         }
+      } catch (e) {
+        console.error('Error cargando datos:', e);
       }
       setLoading(false);
     }
-    loadData();
-  }, []);
 
-  // Abrir formulario precargado para editar receta
+    loadAuthorizedData();
+  }, [session, isApprovedUser, isAdmin]);
+
+  // Handlers de Autenticación
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    setAuthSubmitting(true);
+    setAuthMessage(null);
+
+    try {
+      if (authMode === 'login') {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: authEmail.trim(),
+          password: authPassword
+        });
+        if (error) throw error;
+      } else {
+        const cleanEmail = authEmail.trim();
+        const cleanName = authNombre.trim() || cleanEmail.split('@')[0];
+
+        const { data, error } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password: authPassword,
+          options: {
+            data: { nombre: cleanName }
+          }
+        });
+        if (error) throw error;
+
+        if (cleanEmail.toLowerCase() !== 'rafaelalon@gmail.com') {
+          await notifyAdminByEmail({ userName: cleanName, userEmail: cleanEmail });
+          setAuthMessage({
+            type: 'success',
+            text: 'Solicitud enviada. Se ha notificado al administrador (rafaelalon@gmail.com). Podrás acceder en cuanto apruebe tu cuenta.'
+          });
+        } else {
+          setAuthMessage({
+            type: 'success',
+            text: 'Cuenta de administrador creada. Iniciando sesión...'
+          });
+        }
+
+        if (!data.session) {
+          setAuthMode('login');
+        }
+      }
+    } catch (err) {
+      setAuthMessage({
+        type: 'error',
+        text: err.message === 'Invalid login credentials'
+          ? 'Correo o contraseña incorrectos.'
+          : err.message
+      });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setSession(null);
+    setUserProfile(null);
+    setActiveTab('planificador');
+  };
+
+  // Gestión de usuarios (Solo Admin)
+  const handleToggleApproveUser = async (targetUser) => {
+    if (targetUser.email.toLowerCase() === 'rafaelalon@gmail.com') return;
+    const newApproved = !targetUser.aprobado;
+    const { error } = await supabase
+      .from('perfiles')
+      .update({ aprobado: newApproved })
+      .eq('id', targetUser.id);
+
+    if (!error) {
+      setAllUsers(prev => prev.map(u => (u.id === targetUser.id ? { ...u, aprobado: newApproved } : u)));
+      showToast(newApproved ? `Acceso aprobado para ${targetUser.email}` : `Acceso revocado para ${targetUser.email}`);
+    }
+  };
+
+  const handleChangeUserRole = async (targetUser, newRole) => {
+    if (targetUser.email.toLowerCase() === 'rafaelalon@gmail.com') return;
+    const { error } = await supabase
+      .from('perfiles')
+      .update({ rol: newRole })
+      .eq('id', targetUser.id);
+
+    if (!error) {
+      setAllUsers(prev => prev.map(u => (u.id === targetUser.id ? { ...u, rol: newRole } : u)));
+      showToast(`Rol actualizado a ${newRole === 'admin' ? 'Administrador' : 'Usuario Estándar'}`);
+    }
+  };
+
+  const handleDeleteUserProfile = async (targetUser) => {
+    if (targetUser.email.toLowerCase() === 'rafaelalon@gmail.com') return;
+    if (!window.confirm(`¿Eliminar el perfil de ${targetUser.email}?`)) return;
+    const { error } = await supabase
+      .from('perfiles')
+      .delete()
+      .eq('id', targetUser.id);
+
+    if (!error) {
+      setAllUsers(prev => prev.filter(u => u.id !== targetUser.id));
+      showToast('Usuario eliminado');
+    }
+  };
+
+  // Abrir formulario precargado para editar receta (Solo Admin)
   const handleStartEditRecipe = (rec) => {
+    if (!isAdmin) return;
     setEditingRecipeId(rec.id);
     setNewRecipe({
       nombre: rec.nombre || '',
@@ -198,10 +408,10 @@ export default function App() {
     setActiveTab('recetario');
   };
 
-  // Guardar nueva receta o actualizar existente
+  // Guardar nueva receta o actualizar existente (Solo Admin)
   const handleSaveRecipe = async (e) => {
     e.preventDefault();
-    if (!newRecipe.nombre.trim()) return;
+    if (!isAdmin || !newRecipe.nombre.trim()) return;
 
     const payload = {
       nombre: newRecipe.nombre.trim(),
@@ -224,12 +434,7 @@ export default function App() {
       const updatedItem = { id: editingRecipeId, ...payload };
       const updated = recipes.map(r => (r.id === editingRecipeId ? updatedItem : r));
       setRecipes(updated);
-
-      if (isSupabaseConfigured) {
-        await supabase.from('recetas').update(payload).eq('id', editingRecipeId);
-      } else {
-        localStorage.setItem('nutriplan_recetas', JSON.stringify(updated));
-      }
+      await supabase.from('recetas').update(payload).eq('id', editingRecipeId);
 
       setEditingRecipeId(null);
       setNewRecipe(EMPTY_RECIPE_FORM);
@@ -239,12 +444,7 @@ export default function App() {
       const item = { id: 'rec-' + Date.now(), ...payload };
       const updated = [item, ...recipes];
       setRecipes(updated);
-
-      if (isSupabaseConfigured) {
-        await supabase.from('recetas').insert([item]);
-      } else {
-        localStorage.setItem('nutriplan_recetas', JSON.stringify(updated));
-      }
+      await supabase.from('recetas').insert([item]);
 
       setNewRecipe(EMPTY_RECIPE_FORM);
       showToast('Receta guardada correctamente');
@@ -253,19 +453,17 @@ export default function App() {
   };
 
   const handleDeleteRecipe = async (id) => {
+    if (!isAdmin) return;
     if (!window.confirm('¿Seguro que quieres eliminar esta receta del recetario?')) return;
     const updated = recipes.filter(r => r.id !== id);
     setRecipes(updated);
-    if (isSupabaseConfigured) {
-      await supabase.from('recetas').delete().eq('id', id);
-    } else {
-      localStorage.setItem('nutriplan_recetas', JSON.stringify(updated));
-    }
+    await supabase.from('recetas').delete().eq('id', id);
     showToast('Receta eliminada');
   };
 
-  // Añadir/quitar receta del plan semanal
+  // Añadir/quitar receta del plan semanal (Solo Admin)
   const addRecipeToSlot = (dia, ingesta, recipeId) => {
+    if (!isAdmin) return;
     setPlan(prev => ({
       ...prev,
       [dia]: {
@@ -278,6 +476,7 @@ export default function App() {
   };
 
   const removeRecipeFromSlot = (dia, ingesta, index) => {
+    if (!isAdmin) return;
     setPlan(prev => {
       const list = [...(prev[dia]?.[ingesta] || [])];
       list.splice(index, 1);
@@ -288,11 +487,13 @@ export default function App() {
     });
   };
 
-  // Guardar dieta semanal
+  // Guardar dieta semanal y asignación de usuario (Solo Admin)
   const handleSaveDiet = async () => {
+    if (!isAdmin) return;
     const dietObj = {
       id: currentDietId,
       nombre: dietName || 'Dieta Semanal',
+      usuario_id: assignedUserId || null,
       plan,
       updated_at: new Date().toISOString()
     };
@@ -300,27 +501,29 @@ export default function App() {
     const exists = weeklyDiets.some(d => d.id === currentDietId);
     const updatedDiets = exists
       ? weeklyDiets.map(d => (d.id === currentDietId ? dietObj : d))
-      : [...weeklyDiets, dietObj];
+      : [dietObj, ...weeklyDiets];
 
     setWeeklyDiets(updatedDiets);
-
-    if (isSupabaseConfigured) {
-      await supabase.from('dietas_semanales').upsert([dietObj]);
+    const { error } = await supabase.from('dietas_semanales').upsert([dietObj]);
+    if (error) {
+      showToast('Error al guardar la dieta: ' + error.message);
     } else {
-      localStorage.setItem('nutriplan_dietas', JSON.stringify(updatedDiets));
+      showToast('Dieta semanal guardada y asignada correctamente');
     }
-    showToast('Dieta semanal guardada en la base de datos');
   };
 
   const handleNewDiet = () => {
+    if (!isAdmin) return;
     const newId = 'dieta-' + Date.now();
     setCurrentDietId(newId);
     setDietName(`Nueva Dieta (${weeklyDiets.length + 1})`);
+    setAssignedUserId('');
     setPlan(createEmptyPlan());
     showToast('Lienzo listo para nueva dieta semanal');
   };
 
   const handleDeleteDiet = async () => {
+    if (!isAdmin) return;
     const isSaved = weeklyDiets.some(d => d.id === currentDietId);
     if (!isSaved) {
       setPlan(createEmptyPlan());
@@ -332,29 +535,25 @@ export default function App() {
 
     const updatedDiets = weeklyDiets.filter(d => d.id !== currentDietId);
     setWeeklyDiets(updatedDiets);
-
-    if (isSupabaseConfigured) {
-      await supabase.from('dietas_semanales').delete().eq('id', currentDietId);
-    } else {
-      localStorage.setItem('nutriplan_dietas', JSON.stringify(updatedDiets));
-    }
+    await supabase.from('dietas_semanales').delete().eq('id', currentDietId);
 
     if (updatedDiets.length > 0) {
       setCurrentDietId(updatedDiets[0].id);
       setDietName(updatedDiets[0].nombre);
+      setAssignedUserId(updatedDiets[0].usuario_id || '');
       setPlan(updatedDiets[0].plan);
     } else {
       setCurrentDietId('dieta-' + Date.now());
       setDietName('Dieta Semanal Principal');
+      setAssignedUserId('');
       setPlan(createEmptyPlan());
     }
 
     showToast('Dieta semanal eliminada');
   };
 
-  // Autogenerar dieta rápida respetando la categoría de la ingesta si existe
   const handleAutoFillWeek = () => {
-    if (recipes.length === 0) return;
+    if (!isAdmin || recipes.length === 0) return;
     const generated = createEmptyPlan();
     DIAS.forEach(dia => {
       INGESTAS.forEach(ing => {
@@ -431,7 +630,7 @@ export default function App() {
     };
   }, [dailyTotals]);
 
-  // GENERAR PDF DE LA DIETA SEMANAL (Cuadrante semanal + Ingredientes y Preparación de cada receta)
+  // GENERAR PDF DE LA DIETA SEMANAL (Disponible para Admin y Usuario Estándar)
   const handleExportDietPDF = () => {
     const usedIdsSet = new Set();
     DIAS.forEach(dia => {
@@ -443,7 +642,7 @@ export default function App() {
     });
 
     if (usedIdsSet.size === 0) {
-      showToast('Añade al menos una receta al plan semanal antes de generar el PDF');
+      showToast('No hay recetas asignadas en esta dieta para exportar');
       return;
     }
 
@@ -451,8 +650,7 @@ export default function App() {
     const title = dietName?.trim() || 'Dieta Semanal';
     const fecha = new Date().toLocaleDateString('es-ES');
 
-    // Cabecera Página 1: Planificación Semanal
-    doc.setFillColor(4, 120, 87); // Emerald 700
+    doc.setFillColor(4, 120, 87);
     doc.rect(0, 0, 297, 22, 'F');
     doc.setTextColor(255, 255, 255);
     doc.setFont('helvetica', 'bold');
@@ -467,7 +665,6 @@ export default function App() {
       17.5
     );
 
-    // Tabla semanal (Filas = Ingestas + Totales diarios, Columnas = Lunes..Domingo)
     const head = [['Ingesta', ...DIAS]];
     const body = INGESTAS.map(ing => {
       const row = [ing];
@@ -488,7 +685,6 @@ export default function App() {
       return row;
     });
 
-    // Fila resumen nutricional por día
     const totalsRow = ['Total Diario'];
     DIAS.forEach(dia => {
       const t = dailyTotals[dia];
@@ -540,7 +736,6 @@ export default function App() {
       }
     });
 
-    // Páginas siguientes (Vertical A4): Recetario detallado con Ingredientes y Preparación
     const usedRecipes = Array.from(usedIdsSet)
       .map(id => recipeMap[id])
       .filter(Boolean);
@@ -573,17 +768,13 @@ export default function App() {
 
       const lineHeight = 4.3;
       const estimatedBlockHeight =
-        16 + // Cabecera receta + macros
-        7 + ingLines.length * lineHeight +
-        7 + prepLines.length * lineHeight +
-        10;
+        16 + 7 + ingLines.length * lineHeight + 7 + prepLines.length * lineHeight + 10;
 
       if (cursorY + Math.min(estimatedBlockHeight, 95) > pageHeight - 14) {
         doc.addPage('a4', 'portrait');
         cursorY = 16;
       }
 
-      // Título de la receta
       doc.setFillColor(241, 245, 249);
       doc.roundedRect(marginX, cursorY, contentWidth, 13, 2, 2, 'F');
 
@@ -605,7 +796,6 @@ export default function App() {
 
       cursorY += 17;
 
-      // Subsección Ingredientes
       if (cursorY + 12 > pageHeight - 14) {
         doc.addPage('a4', 'portrait');
         cursorY = 16;
@@ -630,7 +820,6 @@ export default function App() {
 
       cursorY += 2.5;
 
-      // Subsección Preparación
       if (cursorY + 12 > pageHeight - 14) {
         doc.addPage('a4', 'portrait');
         cursorY = 16;
@@ -653,7 +842,6 @@ export default function App() {
         cursorY += lineHeight;
       });
 
-      // Separador entre recetas
       cursorY += 3;
       if (cursorY < pageHeight - 14) {
         doc.setDrawColor(226, 232, 240);
@@ -663,7 +851,6 @@ export default function App() {
       }
     });
 
-    // Numeración de páginas
     const totalPages = doc.getNumberOfPages();
     for (let i = 1; i <= totalPages; i++) {
       doc.setPage(i);
@@ -685,6 +872,170 @@ export default function App() {
     doc.save(`${safeFileName || 'dieta-semanal'}.pdf`);
     showToast('PDF de la dieta semanal generado correctamente');
   };
+
+  // =========================================================================
+  // PANTALLA DE CARGA INICIAL
+  // =========================================================================
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500 text-sm">
+        Verificando sesión de usuario...
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // PANTALLA DE LOGIN / SOLICITUD DE ALTA
+  // =========================================================================
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-emerald-800 via-emerald-700 to-teal-900 flex items-center justify-center p-4">
+        <div className="bg-white rounded-3xl shadow-2xl max-w-md w-full p-8 space-y-6">
+          <div className="text-center space-y-2">
+            <div className="bg-emerald-100 text-emerald-700 w-14 h-14 rounded-2xl flex items-center justify-center mx-auto">
+              <Utensils className="w-7 h-7" />
+            </div>
+            <h1 className="text-2xl font-bold text-slate-800">NutriPlan Pro</h1>
+            <p className="text-xs text-slate-500">Control nutricional y planificación personalizada de dietas</p>
+          </div>
+
+          <div className="grid grid-cols-2 bg-slate-100 p-1 rounded-xl text-sm font-medium">
+            <button
+              type="button"
+              onClick={() => { setAuthMode('login'); setAuthMessage(null); }}
+              className={`py-2 rounded-lg flex items-center justify-center gap-1.5 transition ${
+                authMode === 'login' ? 'bg-white text-emerald-700 shadow-xs' : 'text-slate-600'
+              }`}
+            >
+              <LogIn className="w-4 h-4" /> Iniciar Sesión
+            </button>
+            <button
+              type="button"
+              onClick={() => { setAuthMode('register'); setAuthMessage(null); }}
+              className={`py-2 rounded-lg flex items-center justify-center gap-1.5 transition ${
+                authMode === 'register' ? 'bg-white text-emerald-700 shadow-xs' : 'text-slate-600'
+              }`}
+            >
+              <UserPlus className="w-4 h-4" /> Solicitar Alta
+            </button>
+          </div>
+
+          {authMessage && (
+            <div className={`p-3.5 rounded-xl text-xs leading-relaxed ${
+              authMessage.type === 'success'
+                ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                : 'bg-rose-50 text-rose-700 border border-rose-200'
+            }`}>
+              {authMessage.text}
+            </div>
+          )}
+
+          <form onSubmit={handleAuthSubmit} className="space-y-4">
+            {authMode === 'register' && (
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Nombre completo *</label>
+                <input
+                  required
+                  type="text"
+                  value={authNombre}
+                  onChange={e => setAuthNombre(e.target.value)}
+                  placeholder="Tu nombre"
+                  className="w-full border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+              </div>
+            )}
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Correo electrónico *</label>
+              <div className="relative">
+                <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
+                <input
+                  required
+                  type="email"
+                  value={authEmail}
+                  onChange={e => setAuthEmail(e.target.value)}
+                  placeholder="ejemplo@correo.com"
+                  className="w-full pl-10 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">Contraseña *</label>
+              <div className="relative">
+                <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
+                <input
+                  required
+                  minLength={6}
+                  type="password"
+                  value={authPassword}
+                  onChange={e => setAuthPassword(e.target.value)}
+                  placeholder="Mínimo 6 caracteres"
+                  className="w-full pl-10 pr-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={authSubmitting}
+              className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm shadow-md transition disabled:opacity-60"
+            >
+              {authSubmitting
+                ? 'Procesando...'
+                : authMode === 'login'
+                  ? 'Entrar a la aplicación'
+                  : 'Enviar solicitud de registro'}
+            </button>
+          </form>
+
+          {authMode === 'register' && (
+            <p className="text-[11px] text-center text-slate-400">
+              Por seguridad, las cuentas nuevas requieren aprobación previa del administrador (<span className="font-medium text-slate-600">rafaelalon@gmail.com</span>).
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // PANTALLA DE ESPERA SI EL USUARIO AÚN NO ESTÁ APROBADO
+  // =========================================================================
+  if (!isApprovedUser) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4">
+        <div className="bg-white rounded-3xl shadow-lg border border-slate-200 max-w-md w-full p-8 text-center space-y-4">
+          <div className="bg-amber-100 text-amber-700 w-14 h-14 rounded-2xl flex items-center justify-center mx-auto">
+            <Clock className="w-7 h-7" />
+          </div>
+          <h2 className="text-xl font-bold text-slate-800">Cuenta pendiente de aprobación</h2>
+          <p className="text-sm text-slate-600 leading-relaxed">
+            Has iniciado sesión como <span className="font-semibold text-slate-800">{session.user.email}</span>, pero tu acceso todavía no ha sido autorizado por el administrador (<span className="font-medium">rafaelalon@gmail.com</span>).
+          </p>
+          <div className="pt-2 flex flex-col gap-2">
+            <button
+              onClick={() => fetchUserProfile(session.user)}
+              className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm transition"
+            >
+              Comprobar si ya estoy aprobado
+            </button>
+            <button
+              onClick={handleLogout}
+              className="w-full py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium text-xs transition"
+            >
+              Cerrar sesión
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // APLICACIÓN PRINCIPAL (ADMINISTRADOR O USUARIO ESTÁNDAR APROBADO)
+  // =========================================================================
+  const pendingUsersCount = allUsers.filter(u => !u.aprobado).length;
 
   const filteredRecipes = recipes.filter(r => {
     const matchesText = r.nombre.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -708,50 +1059,78 @@ export default function App() {
             </div>
             <div>
               <h1 className="font-bold text-lg leading-tight">NutriPlan Pro</h1>
-              <p className="text-xs text-emerald-100 flex items-center gap-1">
-                {isSupabaseConfigured ? (
-                  <><Database className="w-3 h-3" /> Conectado a Supabase (Nube)</>
+              <p className="text-xs text-emerald-100 flex items-center gap-1.5">
+                {isAdmin ? (
+                  <><ShieldCheck className="w-3.5 h-3.5 text-amber-300" /> Administrador · {userProfile?.email}</>
                 ) : (
-                  <><HardDrive className="w-3 h-3" /> Modo Local (Configura Supabase para nube)</>
+                  <><Database className="w-3 h-3" /> {userProfile?.nombre || userProfile?.email} (Solo lectura)</>
                 )}
               </p>
             </div>
           </div>
 
-          <nav className="flex items-center gap-1.5 bg-emerald-800/60 p-1 rounded-xl">
-            <button
-              onClick={() => setActiveTab('planificador')}
-              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${
-                activeTab === 'planificador' ? 'bg-white text-emerald-800 shadow' : 'text-emerald-100 hover:bg-emerald-700/50'
-              }`}
-            >
-              <Calendar className="w-4 h-4" /> Dieta Semanal
-            </button>
-            <button
-              onClick={() => setActiveTab('recetario')}
-              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${
-                activeTab === 'recetario' ? 'bg-white text-emerald-800 shadow' : 'text-emerald-100 hover:bg-emerald-700/50'
-              }`}
-            >
-              <Utensils className="w-4 h-4" /> Recetario ({recipes.length})
-            </button>
-            <button
-              onClick={() => {
-                setEditingRecipeId(null);
-                setNewRecipe(EMPTY_RECIPE_FORM);
-                setActiveTab('nueva-receta');
-              }}
-              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${
-                activeTab === 'nueva-receta' ? 'bg-white text-emerald-800 shadow' : 'text-emerald-100 hover:bg-emerald-700/50'
-              }`}
-            >
-              {editingRecipeId ? (
-                <><Pencil className="w-4 h-4" /> Editando Receta</>
-              ) : (
-                <><Plus className="w-4 h-4" /> Nueva Receta</>
+          <div className="flex flex-wrap items-center gap-2">
+            <nav className="flex items-center gap-1.5 bg-emerald-800/60 p-1 rounded-xl">
+              <button
+                onClick={() => setActiveTab('planificador')}
+                className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${
+                  activeTab === 'planificador' ? 'bg-white text-emerald-800 shadow' : 'text-emerald-100 hover:bg-emerald-700/50'
+                }`}
+              >
+                <Calendar className="w-4 h-4" /> {isAdmin ? 'Dieta Semanal' : 'Mis Dietas'}
+              </button>
+
+              {isAdmin && (
+                <>
+                  <button
+                    onClick={() => setActiveTab('recetario')}
+                    className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${
+                      activeTab === 'recetario' ? 'bg-white text-emerald-800 shadow' : 'text-emerald-100 hover:bg-emerald-700/50'
+                    }`}
+                  >
+                    <Utensils className="w-4 h-4" /> Recetario ({recipes.length})
+                  </button>
+                  <button
+                    onClick={() => {
+                      setEditingRecipeId(null);
+                      setNewRecipe(EMPTY_RECIPE_FORM);
+                      setActiveTab('nueva-receta');
+                    }}
+                    className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${
+                      activeTab === 'nueva-receta' ? 'bg-white text-emerald-800 shadow' : 'text-emerald-100 hover:bg-emerald-700/50'
+                    }`}
+                  >
+                    {editingRecipeId ? (
+                      <><Pencil className="w-4 h-4" /> Editando Receta</>
+                    ) : (
+                      <><Plus className="w-4 h-4" /> Nueva Receta</>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('usuarios')}
+                    className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition relative ${
+                      activeTab === 'usuarios' ? 'bg-white text-emerald-800 shadow' : 'text-emerald-100 hover:bg-emerald-700/50'
+                    }`}
+                  >
+                    <Users className="w-4 h-4" /> Usuarios
+                    {pendingUsersCount > 0 && (
+                      <span className="bg-amber-400 text-slate-900 text-[10px] font-bold px-1.5 py-0.2 rounded-full">
+                        {pendingUsersCount}
+                      </span>
+                    )}
+                  </button>
+                </>
               )}
+            </nav>
+
+            <button
+              onClick={handleLogout}
+              title="Cerrar sesión"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-emerald-900/60 hover:bg-emerald-950 text-emerald-100 transition"
+            >
+              <LogOut className="w-4 h-4" /> Salir
             </button>
-          </nav>
+          </div>
         </div>
       </header>
 
@@ -766,195 +1145,248 @@ export default function App() {
       {/* Main Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-6">
         {loading ? (
-          <div className="text-center py-20 text-slate-500">Cargando recetario y datos nutricionales...</div>
+          <div className="text-center py-20 text-slate-500">Cargando dietas y recetas...</div>
         ) : (
           <>
             {/* PESTAÑA 1: PLANIFICADOR DE DIETA SEMANAL */}
             {activeTab === 'planificador' && (
               <div className="space-y-6">
-                {/* Barra de controles de dieta */}
-                <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 flex flex-wrap items-center justify-between gap-4">
-                  <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[260px]">
-                    <input
-                      type="text"
-                      value={dietName}
-                      onChange={(e) => setDietName(e.target.value)}
-                      placeholder="Nombre de la dieta semanal..."
-                      className="font-semibold text-slate-800 bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                    />
-                    {weeklyDiets.length > 0 && (
-                      <div className="flex items-center gap-1.5">
-                        <select
-                          value={currentDietId}
-                          onChange={(e) => {
-                            const found = weeklyDiets.find(d => d.id === e.target.value);
-                            if (found) {
-                              setCurrentDietId(found.id);
-                              setDietName(found.nombre);
-                              setPlan(found.plan);
-                            }
-                          }}
-                          className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-sm"
-                        >
-                          {weeklyDiets.map(d => (
-                            <option key={d.id} value={d.id}>{d.nombre}</option>
-                          ))}
-                        </select>
+                {/* Si el usuario estándar aún no tiene dietas asignadas */}
+                {!isAdmin && weeklyDiets.length === 0 ? (
+                  <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center space-y-2">
+                    <Calendar className="w-10 h-10 text-slate-300 mx-auto" />
+                    <h2 className="text-lg font-bold text-slate-800">Aún no tienes dietas semanales asignadas</h2>
+                    <p className="text-sm text-slate-500">
+                      Cuando el administrador te asigne tu menú semanal, aparecerá aquí automáticamente con todos sus platos, ingredientes y preparación.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    {/* Barra de controles de dieta */}
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 flex flex-wrap items-center justify-between gap-4">
+                      <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[260px]">
+                        {isAdmin ? (
+                          <input
+                            type="text"
+                            value={dietName}
+                            onChange={(e) => setDietName(e.target.value)}
+                            placeholder="Nombre de la dieta semanal..."
+                            className="font-semibold text-slate-800 bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                          />
+                        ) : (
+                          <h2 className="font-bold text-slate-800 text-base px-1">{dietName}</h2>
+                        )}
+
+                        {weeklyDiets.length > 0 && (
+                          <div className="flex items-center gap-1.5">
+                            <select
+                              value={currentDietId}
+                              onChange={(e) => {
+                                const found = weeklyDiets.find(d => d.id === e.target.value);
+                                if (found) {
+                                  setCurrentDietId(found.id);
+                                  setDietName(found.nombre);
+                                  setAssignedUserId(found.usuario_id || '');
+                                  setPlan(found.plan);
+                                }
+                              }}
+                              className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-sm"
+                            >
+                              {weeklyDiets.map(d => (
+                                <option key={d.id} value={d.id}>{d.nombre}</option>
+                              ))}
+                            </select>
+
+                            {isAdmin && (
+                              <button
+                                onClick={handleDeleteDiet}
+                                title="Eliminar dieta seleccionada"
+                                className="p-2 rounded-xl text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-200 transition"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Selector de Usuario Asignado (Solo Admin) */}
+                        {isAdmin && (
+                          <div className="flex items-center gap-1.5 bg-emerald-50/70 border border-emerald-200 rounded-xl px-2.5 py-1.5">
+                            <Users className="w-4 h-4 text-emerald-700" />
+                            <select
+                              value={assignedUserId}
+                              onChange={(e) => setAssignedUserId(e.target.value)}
+                              className="bg-transparent text-xs font-semibold text-emerald-900 focus:outline-none"
+                              title="Asignar esta dieta a un usuario"
+                            >
+                              <option value="">Sin asignar (Solo Admin)</option>
+                              {allUsers.filter(u => u.aprobado).map(u => (
+                                <option key={u.id} value={u.id}>
+                                  Asignada a: {u.nombre || u.email} ({u.email})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        {isAdmin && (
+                          <>
+                            <button
+                              onClick={handleAutoFillWeek}
+                              className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition"
+                            >
+                              <Sparkles className="w-4 h-4" /> Autogenerar Menú
+                            </button>
+                            <button
+                              onClick={handleNewDiet}
+                              className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium bg-slate-100 text-slate-700 hover:bg-slate-200 transition"
+                            >
+                              <Copy className="w-4 h-4" /> Nueva Semana
+                            </button>
+                          </>
+                        )}
+
                         <button
-                          onClick={handleDeleteDiet}
-                          title="Eliminar dieta seleccionada"
-                          className="p-2 rounded-xl text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-200 transition"
+                          onClick={handleExportDietPDF}
+                          title="Descargar PDF con el cuadrante semanal, ingredientes y preparación de cada receta"
+                          className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold bg-rose-600 text-white hover:bg-rose-700 shadow-sm transition"
                         >
-                          <Trash2 className="w-4 h-4" />
+                          <FileDown className="w-4 h-4" /> Descargar PDF
                         </button>
+
+                        {isAdmin && (
+                          <button
+                            onClick={handleSaveDiet}
+                            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 shadow-sm transition"
+                          >
+                            <Save className="w-4 h-4" /> Guardar Dieta
+                          </button>
+                        )}
                       </div>
-                    )}
-                  </div>
+                    </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      onClick={handleAutoFillWeek}
-                      className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition"
-                    >
-                      <Sparkles className="w-4 h-4" /> Autogenerar Menú
-                    </button>
-                    <button
-                      onClick={handleNewDiet}
-                      className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium bg-slate-100 text-slate-700 hover:bg-slate-200 transition"
-                    >
-                      <Copy className="w-4 h-4" /> Nueva Semana
-                    </button>
-                    <button
-                      onClick={handleExportDietPDF}
-                      title="Descargar PDF con el cuadrante semanal, ingredientes y preparación de cada receta"
-                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold bg-rose-600 text-white hover:bg-rose-700 shadow-sm transition"
-                    >
-                      <FileDown className="w-4 h-4" /> Descargar PDF
-                    </button>
-                    <button
-                      onClick={handleSaveDiet}
-                      className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 shadow-sm transition"
-                    >
-                      <Save className="w-4 h-4" /> Guardar Dieta
-                    </button>
-                  </div>
-                </div>
+                    {/* Resumen promedio semanal */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                      <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
+                        <div className="text-xs text-slate-500 flex items-center gap-1"><Flame className="w-3.5 h-3.5 text-orange-500" /> Media Energía</div>
+                        <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.kcal} <span className="text-xs font-normal text-slate-500">kcal/día</span></div>
+                      </div>
+                      <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
+                        <div className="text-xs text-slate-500 flex items-center gap-1"><Drumstick className="w-3.5 h-3.5 text-rose-500" /> Media Proteína</div>
+                        <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.proteina} <span className="text-xs font-normal text-slate-500">g/día</span></div>
+                      </div>
+                      <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
+                        <div className="text-xs text-slate-500 flex items-center gap-1"><Wheat className="w-3.5 h-3.5 text-amber-500" /> Media Hidratos</div>
+                        <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.hidratos} <span className="text-xs font-normal text-slate-500">g/día</span></div>
+                      </div>
+                      <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
+                        <div className="text-xs text-slate-500 flex items-center gap-1"><Droplet className="w-3.5 h-3.5 text-yellow-500" /> Media Grasas</div>
+                        <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.grasas} <span className="text-xs font-normal text-slate-500">g/día</span></div>
+                      </div>
+                      <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
+                        <div className="text-xs text-slate-500">Media Fibra</div>
+                        <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.fibra} <span className="text-xs font-normal text-slate-500">g/día</span></div>
+                      </div>
+                      <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
+                        <div className="text-xs text-slate-500">Media Sodio</div>
+                        <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.sodio} <span className="text-xs font-normal text-slate-500">mg/día</span></div>
+                      </div>
+                    </div>
 
-                {/* Resumen promedio semanal */}
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
-                    <div className="text-xs text-slate-500 flex items-center gap-1"><Flame className="w-3.5 h-3.5 text-orange-500" /> Media Energía</div>
-                    <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.kcal} <span className="text-xs font-normal text-slate-500">kcal/día</span></div>
-                  </div>
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
-                    <div className="text-xs text-slate-500 flex items-center gap-1"><Drumstick className="w-3.5 h-3.5 text-rose-500" /> Media Proteína</div>
-                    <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.proteina} <span className="text-xs font-normal text-slate-500">g/día</span></div>
-                  </div>
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
-                    <div className="text-xs text-slate-500 flex items-center gap-1"><Wheat className="w-3.5 h-3.5 text-amber-500" /> Media Hidratos</div>
-                    <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.hidratos} <span className="text-xs font-normal text-slate-500">g/día</span></div>
-                  </div>
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
-                    <div className="text-xs text-slate-500 flex items-center gap-1"><Droplet className="w-3.5 h-3.5 text-yellow-500" /> Media Grasas</div>
-                    <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.grasas} <span className="text-xs font-normal text-slate-500">g/día</span></div>
-                  </div>
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
-                    <div className="text-xs text-slate-500">Media Fibra</div>
-                    <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.fibra} <span className="text-xs font-normal text-slate-500">g/día</span></div>
-                  </div>
-                  <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-sm">
-                    <div className="text-xs text-slate-500">Media Sodio</div>
-                    <div className="text-xl font-bold text-slate-800 mt-1">{weeklyAverage.sodio} <span className="text-xs font-normal text-slate-500">mg/día</span></div>
-                  </div>
-                </div>
+                    {/* Cuadrícula de 7 días */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-7 gap-4">
+                      {DIAS.map(dia => {
+                        const tot = dailyTotals[dia];
+                        return (
+                          <div key={dia} className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col overflow-hidden">
+                            <div className="bg-slate-800 text-white px-3.5 py-2.5 flex items-center justify-between">
+                              <span className="font-bold text-sm">{dia}</span>
+                              <span className="text-xs bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full font-semibold">
+                                {Math.round(tot.kcal)} kcal
+                              </span>
+                            </div>
 
-                {/* Cuadrícula de 7 días con totales nutricionales por día */}
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-7 gap-4">
-                  {DIAS.map(dia => {
-                    const tot = dailyTotals[dia];
-                    return (
-                      <div key={dia} className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col overflow-hidden">
-                        <div className="bg-slate-800 text-white px-3.5 py-2.5 flex items-center justify-between">
-                          <span className="font-bold text-sm">{dia}</span>
-                          <span className="text-xs bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded-full font-semibold">
-                            {Math.round(tot.kcal)} kcal
-                          </span>
-                        </div>
-
-                        {/* Ingestas del día */}
-                        <div className="p-2.5 space-y-2.5 flex-1">
-                          {INGESTAS.map(ing => {
-                            const items = plan[dia]?.[ing] || [];
-                            return (
-                              <div key={ing} className="bg-slate-50 rounded-xl p-2 border border-slate-100">
-                                <div className="flex items-center justify-between mb-1.5">
-                                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">{ing}</span>
-                                  <button
-                                    onClick={() => {
-                                      setPickerCategory('Todas');
-                                      setPickerTarget({ dia, ingesta: ing });
-                                    }}
-                                    className="text-emerald-600 hover:bg-emerald-100 p-1 rounded-md transition"
-                                    title="Añadir receta"
-                                  >
-                                    <Plus className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                                {items.length === 0 ? (
-                                  <div className="text-[11px] text-slate-400 italic py-1">Sin asignar</div>
-                                ) : (
-                                  <div className="space-y-1">
-                                    {items.map((recId, idx) => {
-                                      const r = recipeMap[recId];
-                                      if (!r) return null;
-                                      return (
-                                        <div key={idx} className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs shadow-2xs group relative">
-                                          <div
-                                            onClick={() => setSelectedRecipeModal(r)}
-                                            className="font-medium text-slate-700 pr-4 cursor-pointer hover:text-emerald-700 line-clamp-2"
-                                          >
-                                            {r.nombre}
-                                          </div>
-                                          <div className="text-[10px] text-slate-400 mt-0.5">
-                                            {r.kcal} kcal · {r.proteina}g P · {r.hidratos}g HC · {r.grasas}g G
-                                          </div>
-                                          <button
-                                            onClick={() => removeRecipeFromSlot(dia, ing, idx)}
-                                            className="absolute top-1.5 right-1 text-slate-300 hover:text-rose-500"
-                                          >
-                                            <X className="w-3.5 h-3.5" />
-                                          </button>
-                                        </div>
-                                      );
-                                    })}
+                            <div className="p-2.5 space-y-2.5 flex-1">
+                              {INGESTAS.map(ing => {
+                                const items = plan[dia]?.[ing] || [];
+                                return (
+                                  <div key={ing} className="bg-slate-50 rounded-xl p-2 border border-slate-100">
+                                    <div className="flex items-center justify-between mb-1.5">
+                                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">{ing}</span>
+                                      {isAdmin && (
+                                        <button
+                                          onClick={() => {
+                                            setPickerCategory('Todas');
+                                            setPickerTarget({ dia, ingesta: ing });
+                                          }}
+                                          className="text-emerald-600 hover:bg-emerald-100 p-1 rounded-md transition"
+                                          title="Añadir receta"
+                                        >
+                                          <Plus className="w-3.5 h-3.5" />
+                                        </button>
+                                      )}
+                                    </div>
+                                    {items.length === 0 ? (
+                                      <div className="text-[11px] text-slate-400 italic py-1">Sin asignar</div>
+                                    ) : (
+                                      <div className="space-y-1">
+                                        {items.map((recId, idx) => {
+                                          const r = recipeMap[recId];
+                                          if (!r) return null;
+                                          return (
+                                            <div key={idx} className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs shadow-2xs group relative">
+                                              <div
+                                                onClick={() => setSelectedRecipeModal(r)}
+                                                className={`font-medium text-slate-700 cursor-pointer hover:text-emerald-700 line-clamp-2 ${isAdmin ? 'pr-4' : ''}`}
+                                                title="Haz clic para ver ingredientes y preparación"
+                                              >
+                                                {r.nombre}
+                                              </div>
+                                              <div className="text-[10px] text-slate-400 mt-0.5">
+                                                {r.kcal} kcal · {r.proteina}g P · {r.hidratos}g HC · {r.grasas}g G
+                                              </div>
+                                              {isAdmin && (
+                                                <button
+                                                  onClick={() => removeRecipeFromSlot(dia, ing, idx)}
+                                                  className="absolute top-1.5 right-1 text-slate-300 hover:text-rose-500"
+                                                >
+                                                  <X className="w-3.5 h-3.5" />
+                                                </button>
+                                              )}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
                                   </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
+                                );
+                              })}
+                            </div>
 
-                        {/* Balance nutricional completo del día */}
-                        <div className="bg-emerald-50/80 border-t border-emerald-100 p-3 text-xs space-y-1">
-                          <div className="font-bold text-emerald-900 mb-1">Total {dia}</div>
-                          <div className="flex justify-between"><span className="text-slate-600">Energía:</span> <span className="font-bold">{Math.round(tot.kcal)} kcal</span></div>
-                          <div className="flex justify-between"><span className="text-slate-600">Proteínas:</span> <span className="font-semibold text-rose-700">{tot.proteina.toFixed(1)} g</span></div>
-                          <div className="flex justify-between"><span className="text-slate-600">Hidratos:</span> <span className="font-semibold text-amber-700">{tot.hidratos.toFixed(1)} g</span></div>
-                          <div className="flex justify-between text-[11px] text-slate-500 pl-2"><span>↳ Azúcares:</span> <span>{tot.azucares.toFixed(1)} g</span></div>
-                          <div className="flex justify-between"><span className="text-slate-600">Grasas:</span> <span className="font-semibold text-yellow-700">{tot.grasas.toFixed(1)} g</span></div>
-                          <div className="flex justify-between text-[11px] text-slate-500 pl-2"><span>↳ Saturadas:</span> <span>{tot.grasas_sat.toFixed(1)} g</span></div>
-                          <div className="flex justify-between"><span className="text-slate-600">Fibra:</span> <span className="font-medium">{tot.fibra.toFixed(1)} g</span></div>
-                          <div className="flex justify-between"><span className="text-slate-600">Sodio:</span> <span className="font-medium">{Math.round(tot.sodio)} mg</span></div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                            <div className="bg-emerald-50/80 border-t border-emerald-100 p-3 text-xs space-y-1">
+                              <div className="font-bold text-emerald-900 mb-1">Total {dia}</div>
+                              <div className="flex justify-between"><span className="text-slate-600">Energía:</span> <span className="font-bold">{Math.round(tot.kcal)} kcal</span></div>
+                              <div className="flex justify-between"><span className="text-slate-600">Proteínas:</span> <span className="font-semibold text-rose-700">{tot.proteina.toFixed(1)} g</span></div>
+                              <div className="flex justify-between"><span className="text-slate-600">Hidratos:</span> <span className="font-semibold text-amber-700">{tot.hidratos.toFixed(1)} g</span></div>
+                              <div className="flex justify-between text-[11px] text-slate-500 pl-2"><span>↳ Azúcares:</span> <span>{tot.azucares.toFixed(1)} g</span></div>
+                              <div className="flex justify-between"><span className="text-slate-600">Grasas:</span> <span className="font-semibold text-yellow-700">{tot.grasas.toFixed(1)} g</span></div>
+                              <div className="flex justify-between text-[11px] text-slate-500 pl-2"><span>↳ Saturadas:</span> <span>{tot.grasas_sat.toFixed(1)} g</span></div>
+                              <div className="flex justify-between"><span className="text-slate-600">Fibra:</span> <span className="font-medium">{tot.fibra.toFixed(1)} g</span></div>
+                              <div className="flex justify-between"><span className="text-slate-600">Sodio:</span> <span className="font-medium">{Math.round(tot.sodio)} mg</span></div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
               </div>
             )}
 
-            {/* PESTAÑA 2: RECETARIO Y FICHAS */}
-            {activeTab === 'recetario' && (
+            {/* PESTAÑA 2: RECETARIO Y FICHAS (SOLO ADMIN) */}
+            {activeTab === 'recetario' && isAdmin && (
               <div className="space-y-5">
                 <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 space-y-3">
                   <div className="flex flex-wrap gap-3 items-center justify-between">
@@ -981,7 +1413,6 @@ export default function App() {
                     </select>
                   </div>
 
-                  {/* Filtro rápido por Dieta de Origen */}
                   <div className="flex flex-wrap items-center gap-1.5 pt-1">
                     <span className="text-xs text-slate-400 mr-1">Origen:</span>
                     {origins.map(orig => (
@@ -1016,7 +1447,6 @@ export default function App() {
                           <span className="text-xs text-slate-500">Porción: {rec.porcion_g} g</span>
                         </div>
 
-                        {/* Badges nutricionales */}
                         <div className="grid grid-cols-4 gap-1.5 my-3 text-center">
                           <div className="bg-orange-50 rounded-lg p-1.5">
                             <div className="text-[10px] text-orange-600 font-medium">Energía</div>
@@ -1071,8 +1501,8 @@ export default function App() {
               </div>
             )}
 
-            {/* PESTAÑA 3: CREAR O MODIFICAR RECETA */}
-            {activeTab === 'nueva-receta' && (
+            {/* PESTAÑA 3: CREAR O MODIFICAR RECETA (SOLO ADMIN) */}
+            {activeTab === 'nueva-receta' && isAdmin && (
               <div className="max-w-3xl mx-auto bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
                 <div className="flex items-center justify-between gap-4 mb-1">
                   <h2 className="text-xl font-bold text-slate-800">
@@ -1204,11 +1634,104 @@ export default function App() {
                 </form>
               </div>
             )}
+
+            {/* PESTAÑA 4: GESTIÓN DE USUARIOS Y APROBACIONES (SOLO ADMIN) */}
+            {activeTab === 'usuarios' && isAdmin && (
+              <div className="max-w-4xl mx-auto space-y-4">
+                <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-800">Control de Acceso y Usuarios</h2>
+                    <p className="text-xs text-slate-500">
+                      Aprueba las solicitudes de registro nuevas, asigna roles y gestiona quién puede entrar al sistema.
+                    </p>
+                  </div>
+                  <div className="text-xs font-semibold px-3 py-1.5 rounded-xl bg-amber-50 text-amber-800 border border-amber-200">
+                    Pendientes de aprobar: {pendingUsersCount}
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="bg-slate-50 border-b border-slate-200 text-xs uppercase text-slate-500">
+                        <tr>
+                          <th className="px-4 py-3">Usuario</th>
+                          <th className="px-4 py-3">Estado</th>
+                          <th className="px-4 py-3">Perfil / Rol</th>
+                          <th className="px-4 py-3 text-right">Acciones</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {allUsers.map(u => {
+                          const isOwner = u.email.toLowerCase() === 'rafaelalon@gmail.com';
+                          return (
+                            <tr key={u.id} className="hover:bg-slate-50/70">
+                              <td className="px-4 py-3">
+                                <div className="font-semibold text-slate-800">{u.nombre || 'Sin nombre'}</div>
+                                <div className="text-xs text-slate-500">{u.email}</div>
+                              </td>
+                              <td className="px-4 py-3">
+                                {u.aprobado ? (
+                                  <span className="inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                    <CheckCircle2 className="w-3.5 h-3.5" /> Aprobado
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                                    <Clock className="w-3.5 h-3.5" /> Pendiente
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3">
+                                {isOwner ? (
+                                  <span className="text-xs font-bold text-emerald-800">Administrador Principal</span>
+                                ) : (
+                                  <select
+                                    value={u.rol}
+                                    onChange={(e) => handleChangeUserRole(u, e.target.value)}
+                                    className="bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-700"
+                                  >
+                                    <option value="usuario">Usuario Estándar (Solo lectura)</option>
+                                    <option value="admin">Administrador (Control total)</option>
+                                  </select>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                {!isOwner && (
+                                  <div className="inline-flex items-center gap-2">
+                                    <button
+                                      onClick={() => handleToggleApproveUser(u)}
+                                      className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition ${
+                                        u.aprobado
+                                          ? 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                                          : 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-2xs'
+                                      }`}
+                                    >
+                                      {u.aprobado ? 'Bloquear' : 'Aprobar Acceso'}
+                                    </button>
+                                    <button
+                                      onClick={() => handleDeleteUserProfile(u)}
+                                      title="Eliminar usuario"
+                                      className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
           </>
         )}
       </main>
 
-      {/* MODAL: DETALLE COMPLETO DE RECETA */}
+      {/* MODAL: DETALLE COMPLETO DE RECETA (Disponible para todos los usuarios aprobados) */}
       {selectedRecipeModal && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-xl w-full max-h-[90vh] overflow-y-auto shadow-xl p-6 space-y-4">
@@ -1228,12 +1751,14 @@ export default function App() {
                 <h2 className="text-xl font-bold text-slate-800 mt-1.5">{selectedRecipeModal.nombre}</h2>
               </div>
               <div className="flex items-center gap-2">
-                <button
-                  onClick={() => handleStartEditRecipe(selectedRecipeModal)}
-                  className="flex items-center gap-1 text-xs font-semibold px-3 py-1.5 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition"
-                >
-                  <Pencil className="w-3.5 h-3.5" /> Editar
-                </button>
+                {isAdmin && (
+                  <button
+                    onClick={() => handleStartEditRecipe(selectedRecipeModal)}
+                    className="flex items-center gap-1 text-xs font-semibold px-3 py-1.5 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition"
+                  >
+                    <Pencil className="w-3.5 h-3.5" /> Editar
+                  </button>
+                )}
                 <button onClick={() => setSelectedRecipeModal(null)} className="text-slate-400 hover:text-slate-700">
                   <X className="w-5 h-5" />
                 </button>
@@ -1268,8 +1793,8 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: SELECTOR DE RECETA PARA EL PLAN SEMANAL */}
-      {pickerTarget && (
+      {/* MODAL: SELECTOR DE RECETA PARA EL PLAN SEMANAL (SOLO ADMIN) */}
+      {pickerTarget && isAdmin && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-lg w-full max-h-[85vh] flex flex-col shadow-xl overflow-hidden">
             <div className="p-4 border-b flex items-center justify-between bg-slate-50">
