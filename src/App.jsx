@@ -5,12 +5,13 @@ import { INITIAL_RECIPES } from './initialRecipes';
 import { supabase, isSupabaseConfigured } from './supabaseClient';
 import {
   Utensils, Calendar, Plus, Search, Trash2, Eye, X, CheckCircle2,
-  Database, HardDrive, Flame, Drumstick, Wheat, Droplet, Sparkles, Save, Copy, Tag,
+  Database, Flame, Drumstick, Wheat, Droplet, Sparkles, Save, Copy, Tag,
   Pencil, FileDown, Users, LogOut, ShieldCheck, Clock, Lock, Mail, UserPlus, LogIn
 } from 'lucide-react';
 
 const DIAS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
 const INGESTAS = ['Desayuno', 'Media Mañana', 'Comida', 'Merienda', 'Cena'];
+const INGESTAS_DOBLES = ['Comida', 'Cena'];
 
 const CATEGORIAS_SUGERIDAS = [
   'Comida / Cena (Plato Principal)',
@@ -32,15 +33,43 @@ const createEmptyPlan = () => {
   DIAS.forEach(dia => {
     plan[dia] = {};
     INGESTAS.forEach(ing => {
-      plan[dia][ing] = [];
+      plan[dia][ing] = INGESTAS_DOBLES.includes(ing)
+        ? { primeros: [], segundos: [] }
+        : [];
     });
   });
   return plan;
 };
 
+// Normaliza cualquier plan cargado (soporta tanto arrays simples como { primeros, segundos })
+const normalizeLoadedPlan = (rawPlan) => {
+  const base = createEmptyPlan();
+  if (!rawPlan || typeof rawPlan !== 'object') return base;
+
+  DIAS.forEach(dia => {
+    INGESTAS.forEach(ing => {
+      const val = rawPlan[dia]?.[ing];
+      if (INGESTAS_DOBLES.includes(ing)) {
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          base[dia][ing] = {
+            primeros: Array.isArray(val.primeros) ? val.primeros : [],
+            segundos: Array.isArray(val.segundos) ? val.segundos : []
+          };
+        } else if (Array.isArray(val)) {
+          base[dia][ing] = { primeros: val, segundos: [] };
+        }
+      } else {
+        base[dia][ing] = Array.isArray(val) ? val : [];
+      }
+    });
+  });
+
+  return base;
+};
+
 const normalizeName = (str) => (str || '').trim().toLowerCase();
 
-// Envío de notificación a rafaelalon@gmail.com vía EmailJS REST API (sin dependencias extra)
+// Envío de notificación a rafaelalon@gmail.com vía EmailJS REST API
 const notifyAdminByEmail = async ({ userName, userEmail }) => {
   const serviceId = import.meta.env.VITE_EMAILJS_SERVICE_ID;
   const templateId = import.meta.env.VITE_EMAILJS_TEMPLATE_ID;
@@ -74,7 +103,7 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
+  const [authMode, setAuthMode] = useState('login');
   const [authNombre, setAuthNombre] = useState('');
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
@@ -98,6 +127,7 @@ export default function App() {
   const [originFilter, setOriginFilter] = useState('Todas');
   const [categoryFilter, setCategoryFilter] = useState('Todas');
   const [selectedRecipeModal, setSelectedRecipeModal] = useState(null);
+  // pickerTarget: { dia, ingesta, tipoPlato?: 'primeros' | 'segundos' }
   const [pickerTarget, setPickerTarget] = useState(null);
   const [pickerSearch, setPickerSearch] = useState('');
   const [pickerCategory, setPickerCategory] = useState('Todas');
@@ -131,7 +161,6 @@ export default function App() {
       return data;
     }
 
-    // Fallback por si el trigger aún no creó el registro
     const isOwner = (user.email || '').toLowerCase() === 'rafaelalon@gmail.com';
     const fallbackProfile = {
       id: user.id,
@@ -237,18 +266,28 @@ export default function App() {
           }
         }
 
-        // 2. Cargar dietas (RLS filtra automáticamente: admin ve todas, usuario solo las suyas)
-        const { data: dbDiets } = await supabase
+        // 2. Cargar dietas con filtro estricto por usuario_id si no es admin
+        let dietsQuery = supabase
           .from('dietas_semanales')
           .select('*')
           .order('updated_at', { ascending: false });
 
+        if (!isAdmin) {
+          dietsQuery = dietsQuery.eq('usuario_id', session.user.id);
+        }
+
+        const { data: dbDiets } = await dietsQuery;
+
         if (dbDiets && dbDiets.length > 0) {
-          setWeeklyDiets(dbDiets);
-          setCurrentDietId(dbDiets[0].id);
-          setDietName(dbDiets[0].nombre);
-          setAssignedUserId(dbDiets[0].usuario_id || '');
-          setPlan(dbDiets[0].plan);
+          const normalizedDiets = dbDiets.map(d => ({
+            ...d,
+            plan: normalizeLoadedPlan(d.plan)
+          }));
+          setWeeklyDiets(normalizedDiets);
+          setCurrentDietId(normalizedDiets[0].id);
+          setDietName(normalizedDiets[0].nombre);
+          setAssignedUserId(normalizedDiets[0].usuario_id || '');
+          setPlan(normalizedDiets[0].plan);
         } else {
           setWeeklyDiets([]);
           setCurrentDietId('dieta-' + Date.now());
@@ -461,23 +500,53 @@ export default function App() {
     showToast('Receta eliminada');
   };
 
-  // Añadir/quitar receta del plan semanal (Solo Admin)
-  const addRecipeToSlot = (dia, ingesta, recipeId) => {
+  // Añadir/quitar receta del plan semanal (soporta 1º y 2º plato en Comida/Cena)
+  const addRecipeToSlot = (dia, ingesta, recipeId, tipoPlato = null) => {
     if (!isAdmin) return;
-    setPlan(prev => ({
-      ...prev,
-      [dia]: {
-        ...prev[dia],
-        [ingesta]: [...(prev[dia]?.[ingesta] || []), recipeId]
+    setPlan(prev => {
+      if (INGESTAS_DOBLES.includes(ingesta) && tipoPlato) {
+        const currentDouble = prev[dia]?.[ingesta] || { primeros: [], segundos: [] };
+        return {
+          ...prev,
+          [dia]: {
+            ...prev[dia],
+            [ingesta]: {
+              ...currentDouble,
+              [tipoPlato]: [...(currentDouble[tipoPlato] || []), recipeId]
+            }
+          }
+        };
       }
-    }));
+      return {
+        ...prev,
+        [dia]: {
+          ...prev[dia],
+          [ingesta]: [...(prev[dia]?.[ingesta] || []), recipeId]
+        }
+      };
+    });
     setPickerTarget(null);
     setPickerSearch('');
   };
 
-  const removeRecipeFromSlot = (dia, ingesta, index) => {
+  const removeRecipeFromSlot = (dia, ingesta, index, tipoPlato = null) => {
     if (!isAdmin) return;
     setPlan(prev => {
+      if (INGESTAS_DOBLES.includes(ingesta) && tipoPlato) {
+        const currentDouble = prev[dia]?.[ingesta] || { primeros: [], segundos: [] };
+        const list = [...(currentDouble[tipoPlato] || [])];
+        list.splice(index, 1);
+        return {
+          ...prev,
+          [dia]: {
+            ...prev[dia],
+            [ingesta]: {
+              ...currentDouble,
+              [tipoPlato]: list
+            }
+          }
+        };
+      }
       const list = [...(prev[dia]?.[ingesta] || [])];
       list.splice(index, 1);
       return {
@@ -555,22 +624,40 @@ export default function App() {
   const handleAutoFillWeek = () => {
     if (!isAdmin || recipes.length === 0) return;
     const generated = createEmptyPlan();
+
+    const entrantesPool = recipes.filter(r =>
+      (r.categoria || '').toLowerCase().includes('entrante') ||
+      (r.categoria || '').toLowerCase().includes('guarnición')
+    );
+    const principalesPool = recipes.filter(r =>
+      (r.categoria || '').toLowerCase().includes('principal') ||
+      ((r.categoria || '').toLowerCase().includes('comida') && !(r.categoria || '').toLowerCase().includes('entrante'))
+    );
+    const lightPool = recipes.filter(r => {
+      const cat = (r.categoria || '').toLowerCase();
+      return cat.includes('desayuno') || cat.includes('merienda') || cat.includes('postre');
+    });
+
+    const pickRandom = (arr) => {
+      const source = arr.length > 0 ? arr : recipes;
+      return source[Math.floor(Math.random() * source.length)].id;
+    };
+
     DIAS.forEach(dia => {
       INGESTAS.forEach(ing => {
-        const isLightMeal = ing === 'Desayuno' || ing === 'Media Mañana' || ing === 'Merienda';
-        const matchingPool = recipes.filter(r => {
-          const cat = (r.categoria || '').toLowerCase();
-          return isLightMeal
-            ? cat.includes('desayuno') || cat.includes('merienda') || cat.includes('postre')
-            : cat.includes('comida') || cat.includes('cena');
-        });
-        const pool = matchingPool.length > 0 ? matchingPool : recipes;
-        const randomRec = pool[Math.floor(Math.random() * pool.length)];
-        generated[dia][ing] = [randomRec.id];
+        if (INGESTAS_DOBLES.includes(ing)) {
+          generated[dia][ing] = {
+            primeros: [pickRandom(entrantesPool)],
+            segundos: [pickRandom(principalesPool)]
+          };
+        } else {
+          generated[dia][ing] = [pickRandom(lightPool)];
+        }
       });
     });
+
     setPlan(generated);
-    showToast('Menú semanal autogenerado por tipo de ingesta');
+    showToast('Menú semanal autogenerado con 1º y 2º plato');
   };
 
   // Mapa rápido id -> receta
@@ -580,30 +667,42 @@ export default function App() {
     return map;
   }, [recipes]);
 
-  // Cálculo nutricional diario
+  // Cálculo nutricional diario (promedia opciones alternativas en 1º y 2º plato)
   const dailyTotals = useMemo(() => {
     const totals = {};
+    const addRecipeNutrients = (acc, r, weight = 1) => {
+      if (!r) return;
+      acc.porcion_g += Number(r.porcion_g || 0) * weight;
+      acc.kcal += Number(r.kcal || 0) * weight;
+      acc.proteina += Number(r.proteina || 0) * weight;
+      acc.hidratos += Number(r.hidratos || 0) * weight;
+      acc.azucares += Number(r.azucares || 0) * weight;
+      acc.grasas += Number(r.grasas || 0) * weight;
+      acc.grasas_sat += Number(r.grasas_sat || 0) * weight;
+      acc.fibra += Number(r.fibra || 0) * weight;
+      acc.sodio += Number(r.sodio || 0) * weight;
+    };
+
     DIAS.forEach(dia => {
       const acc = {
         porcion_g: 0, kcal: 0, proteina: 0, hidratos: 0,
         azucares: 0, grasas: 0, grasas_sat: 0, fibra: 0, sodio: 0
       };
       INGESTAS.forEach(ing => {
-        const ids = plan[dia]?.[ing] || [];
-        ids.forEach(id => {
-          const r = recipeMap[id];
-          if (r) {
-            acc.porcion_g += Number(r.porcion_g || 0);
-            acc.kcal += Number(r.kcal || 0);
-            acc.proteina += Number(r.proteina || 0);
-            acc.hidratos += Number(r.hidratos || 0);
-            acc.azucares += Number(r.azucares || 0);
-            acc.grasas += Number(r.grasas || 0);
-            acc.grasas_sat += Number(r.grasas_sat || 0);
-            acc.fibra += Number(r.fibra || 0);
-            acc.sodio += Number(r.sodio || 0);
+        const slot = plan[dia]?.[ing];
+        if (INGESTAS_DOBLES.includes(ing)) {
+          const primeros = (slot?.primeros || []).map(id => recipeMap[id]).filter(Boolean);
+          const segundos = (slot?.segundos || []).map(id => recipeMap[id]).filter(Boolean);
+          if (primeros.length > 0) {
+            primeros.forEach(r => addRecipeNutrients(acc, r, 1 / primeros.length));
           }
-        });
+          if (segundos.length > 0) {
+            segundos.forEach(r => addRecipeNutrients(acc, r, 1 / segundos.length));
+          }
+        } else {
+          const ids = Array.isArray(slot) ? slot : [];
+          ids.forEach(id => addRecipeNutrients(acc, recipeMap[id], 1));
+        }
       });
       totals[dia] = acc;
     });
@@ -630,14 +729,18 @@ export default function App() {
     };
   }, [dailyTotals]);
 
-  // GENERAR PDF DE LA DIETA SEMANAL (Disponible para Admin y Usuario Estándar)
+  // GENERAR PDF DE LA DIETA SEMANAL (Incluye todas las opciones de 1º y 2º plato)
   const handleExportDietPDF = () => {
     const usedIdsSet = new Set();
     DIAS.forEach(dia => {
       INGESTAS.forEach(ing => {
-        (plan[dia]?.[ing] || []).forEach(id => {
-          if (recipeMap[id]) usedIdsSet.add(id);
-        });
+        const slot = plan[dia]?.[ing];
+        if (INGESTAS_DOBLES.includes(ing)) {
+          (slot?.primeros || []).forEach(id => { if (recipeMap[id]) usedIdsSet.add(id); });
+          (slot?.segundos || []).forEach(id => { if (recipeMap[id]) usedIdsSet.add(id); });
+        } else {
+          (Array.isArray(slot) ? slot : []).forEach(id => { if (recipeMap[id]) usedIdsSet.add(id); });
+        }
       });
     });
 
@@ -669,17 +772,46 @@ export default function App() {
     const body = INGESTAS.map(ing => {
       const row = [ing];
       DIAS.forEach(dia => {
-        const items = (plan[dia]?.[ing] || [])
-          .map(id => recipeMap[id])
-          .filter(Boolean);
-        if (items.length === 0) {
-          row.push('—');
+        const slot = plan[dia]?.[ing];
+        if (INGESTAS_DOBLES.includes(ing)) {
+          const primeros = (slot?.primeros || []).map(id => recipeMap[id]).filter(Boolean);
+          const segundos = (slot?.segundos || []).map(id => recipeMap[id]).filter(Boolean);
+
+          if (primeros.length === 0 && segundos.length === 0) {
+            row.push('—');
+          } else {
+            const parts = [];
+            if (primeros.length > 0) {
+              parts.push(
+                '1º PLATO:\n' +
+                primeros
+                  .map((r, i) => `${primeros.length > 1 ? `Op.${i + 1}: ` : '• '}${r.nombre} (${Math.round(r.kcal)} kcal)`)
+                  .join('\n')
+              );
+            }
+            if (segundos.length > 0) {
+              parts.push(
+                '2º PLATO:\n' +
+                segundos
+                  .map((r, i) => `${segundos.length > 1 ? `Op.${i + 1}: ` : '• '}${r.nombre} (${Math.round(r.kcal)} kcal)`)
+                  .join('\n')
+              );
+            }
+            row.push(parts.join('\n\n'));
+          }
         } else {
-          row.push(
-            items
-              .map(r => '• ' + r.nombre + '\n  (' + Math.round(r.kcal) + ' kcal · ' + r.proteina + 'g P)')
-              .join('\n')
-          );
+          const items = (Array.isArray(slot) ? slot : [])
+            .map(id => recipeMap[id])
+            .filter(Boolean);
+          if (items.length === 0) {
+            row.push('—');
+          } else {
+            row.push(
+              items
+                .map(r => '• ' + r.nombre + '\n  (' + Math.round(r.kcal) + ' kcal · ' + r.proteina + 'g P)')
+                .join('\n')
+            );
+          }
         }
       });
       return row;
@@ -702,8 +834,8 @@ export default function App() {
       margin: { left: 10, right: 10 },
       styles: {
         font: 'helvetica',
-        fontSize: 7.5,
-        cellPadding: 2.2,
+        fontSize: 7.2,
+        cellPadding: 2,
         textColor: [30, 41, 59],
         lineColor: [203, 213, 225],
         lineWidth: 0.2,
@@ -1048,6 +1180,40 @@ export default function App() {
   const origins = ['Todas', ...Array.from(new Set(recipes.map(r => r.origen).filter(Boolean)))];
   const categories = ['Todas', ...Array.from(new Set(recipes.map(r => r.categoria || 'General')))];
 
+  // Renderizador reutilizable para tarjetas de receta en cada hueco
+  const renderRecipeCard = (dia, ing, recId, idx, tipoPlato = null, showOptionNumber = false) => {
+    const r = recipeMap[recId];
+    if (!r) return null;
+    return (
+      <div key={`${recId}-${idx}`} className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs shadow-2xs group relative">
+        <div
+          onClick={() => setSelectedRecipeModal(r)}
+          className={`font-medium text-slate-700 cursor-pointer hover:text-emerald-700 line-clamp-2 ${isAdmin ? 'pr-4' : ''}`}
+          title="Haz clic para ver ingredientes y preparación"
+        >
+          {showOptionNumber && (
+            <span className="inline-block text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1 rounded mr-1">
+              Op.{idx + 1}
+            </span>
+          )}
+          {r.nombre}
+        </div>
+        <div className="text-[10px] text-slate-400 mt-0.5">
+          {r.kcal} kcal · {r.proteina}g P · {r.hidratos}g HC · {r.grasas}g G
+        </div>
+        {isAdmin && (
+          <button
+            onClick={() => removeRecipeFromSlot(dia, ing, idx, tipoPlato)}
+            className="absolute top-1.5 right-1 text-slate-300 hover:text-rose-500"
+            title="Quitar opción"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* Header */}
@@ -1151,7 +1317,6 @@ export default function App() {
             {/* PESTAÑA 1: PLANIFICADOR DE DIETA SEMANAL */}
             {activeTab === 'planificador' && (
               <div className="space-y-6">
-                {/* Si el usuario estándar aún no tiene dietas asignadas */}
                 {!isAdmin && weeklyDiets.length === 0 ? (
                   <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center space-y-2">
                     <Calendar className="w-10 h-10 text-slate-300 mx-auto" />
@@ -1187,7 +1352,7 @@ export default function App() {
                                   setCurrentDietId(found.id);
                                   setDietName(found.nombre);
                                   setAssignedUserId(found.usuario_id || '');
-                                  setPlan(found.plan);
+                                  setPlan(normalizeLoadedPlan(found.plan));
                                 }
                               }}
                               className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-sm"
@@ -1310,7 +1475,84 @@ export default function App() {
 
                             <div className="p-2.5 space-y-2.5 flex-1">
                               {INGESTAS.map(ing => {
-                                const items = plan[dia]?.[ing] || [];
+                                const isDoubleMeal = INGESTAS_DOBLES.includes(ing);
+
+                                if (isDoubleMeal) {
+                                  const slot = plan[dia]?.[ing] || { primeros: [], segundos: [] };
+                                  const primeros = slot.primeros || [];
+                                  const segundos = slot.segundos || [];
+
+                                  return (
+                                    <div key={ing} className="bg-slate-50 rounded-xl p-2 border border-slate-200/80 space-y-2">
+                                      <div className="text-[11px] font-bold uppercase tracking-wider text-slate-600 border-b border-slate-200/70 pb-1">
+                                        {ing}
+                                      </div>
+
+                                      {/* Bloque 1º Plato */}
+                                      <div className="space-y-1">
+                                        <div className="flex items-center justify-between">
+                                          <span className="text-[10px] font-semibold text-emerald-700">
+                                            1º Plato {primeros.length > 1 ? `(${primeros.length} opc.)` : ''}
+                                          </span>
+                                          {isAdmin && (
+                                            <button
+                                              onClick={() => {
+                                                setPickerCategory('Todas');
+                                                setPickerTarget({ dia, ingesta: ing, tipoPlato: 'primeros' });
+                                              }}
+                                              className="text-emerald-600 hover:bg-emerald-100 px-1.5 py-0.5 rounded-md transition flex items-center gap-0.5 text-[10px] font-semibold"
+                                              title="Añadir opción de primer plato"
+                                            >
+                                              <Plus className="w-3 h-3" /> Opción
+                                            </button>
+                                          )}
+                                        </div>
+                                        {primeros.length === 0 ? (
+                                          <div className="text-[10px] text-slate-400 italic">Sin 1º plato</div>
+                                        ) : (
+                                          <div className="space-y-1">
+                                            {primeros.map((recId, idx) =>
+                                              renderRecipeCard(dia, ing, recId, idx, 'primeros', primeros.length > 1)
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+
+                                      {/* Bloque 2º Plato */}
+                                      <div className="space-y-1 pt-1 border-t border-slate-200/60">
+                                        <div className="flex items-center justify-between">
+                                          <span className="text-[10px] font-semibold text-emerald-700">
+                                            2º Plato {segundos.length > 1 ? `(${segundos.length} opc.)` : ''}
+                                          </span>
+                                          {isAdmin && (
+                                            <button
+                                              onClick={() => {
+                                                setPickerCategory('Todas');
+                                                setPickerTarget({ dia, ingesta: ing, tipoPlato: 'segundos' });
+                                              }}
+                                              className="text-emerald-600 hover:bg-emerald-100 px-1.5 py-0.5 rounded-md transition flex items-center gap-0.5 text-[10px] font-semibold"
+                                              title="Añadir opción de segundo plato"
+                                            >
+                                              <Plus className="w-3 h-3" /> Opción
+                                            </button>
+                                          )}
+                                        </div>
+                                        {segundos.length === 0 ? (
+                                          <div className="text-[10px] text-slate-400 italic">Sin 2º plato</div>
+                                        ) : (
+                                          <div className="space-y-1">
+                                            {segundos.map((recId, idx) =>
+                                              renderRecipeCard(dia, ing, recId, idx, 'segundos', segundos.length > 1)
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                }
+
+                                // Ingestas simples (Desayuno, Media Mañana, Merienda)
+                                const items = Array.isArray(plan[dia]?.[ing]) ? plan[dia][ing] : [];
                                 return (
                                   <div key={ing} className="bg-slate-50 rounded-xl p-2 border border-slate-100">
                                     <div className="flex items-center justify-between mb-1.5">
@@ -1332,32 +1574,9 @@ export default function App() {
                                       <div className="text-[11px] text-slate-400 italic py-1">Sin asignar</div>
                                     ) : (
                                       <div className="space-y-1">
-                                        {items.map((recId, idx) => {
-                                          const r = recipeMap[recId];
-                                          if (!r) return null;
-                                          return (
-                                            <div key={idx} className="bg-white border border-slate-200 rounded-lg p-1.5 text-xs shadow-2xs group relative">
-                                              <div
-                                                onClick={() => setSelectedRecipeModal(r)}
-                                                className={`font-medium text-slate-700 cursor-pointer hover:text-emerald-700 line-clamp-2 ${isAdmin ? 'pr-4' : ''}`}
-                                                title="Haz clic para ver ingredientes y preparación"
-                                              >
-                                                {r.nombre}
-                                              </div>
-                                              <div className="text-[10px] text-slate-400 mt-0.5">
-                                                {r.kcal} kcal · {r.proteina}g P · {r.hidratos}g HC · {r.grasas}g G
-                                              </div>
-                                              {isAdmin && (
-                                                <button
-                                                  onClick={() => removeRecipeFromSlot(dia, ing, idx)}
-                                                  className="absolute top-1.5 right-1 text-slate-300 hover:text-rose-500"
-                                                >
-                                                  <X className="w-3.5 h-3.5" />
-                                                </button>
-                                              )}
-                                            </div>
-                                          );
-                                        })}
+                                        {items.map((recId, idx) =>
+                                          renderRecipeCard(dia, ing, recId, idx, null, false)
+                                        )}
                                       </div>
                                     )}
                                   </div>
@@ -1800,7 +2019,11 @@ export default function App() {
             <div className="p-4 border-b flex items-center justify-between bg-slate-50">
               <div>
                 <h3 className="font-bold text-slate-800">Añadir a {pickerTarget.dia}</h3>
-                <p className="text-xs text-slate-500">Ingesta: {pickerTarget.ingesta}</p>
+                <p className="text-xs text-slate-500">
+                  Ingesta: {pickerTarget.ingesta}
+                  {pickerTarget.tipoPlato === 'primeros' && ' · Opción de 1º Plato'}
+                  {pickerTarget.tipoPlato === 'segundos' && ' · Opción de 2º Plato'}
+                </p>
               </div>
               <button onClick={() => setPickerTarget(null)} className="text-slate-400 hover:text-slate-700">
                 <X className="w-5 h-5" />
@@ -1837,7 +2060,7 @@ export default function App() {
                 .map(r => (
                   <button
                     key={r.id}
-                    onClick={() => addRecipeToSlot(pickerTarget.dia, pickerTarget.ingesta, r.id)}
+                    onClick={() => addRecipeToSlot(pickerTarget.dia, pickerTarget.ingesta, r.id, pickerTarget.tipoPlato)}
                     className="w-full text-left p-2.5 rounded-xl hover:bg-emerald-50 border border-transparent hover:border-emerald-200 transition flex items-center justify-between gap-2"
                   >
                     <div>
